@@ -8,17 +8,16 @@ import psutil
 import matplotlib
 import matplotlib.pyplot as plt
 from pathlib import Path
-
 import tensorflow as tf
 from tensorflow.keras.applications import MobileNetV3Small
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.layers import GlobalAveragePooling2D, GlobalMaxPooling2D, Dense, Dropout, BatchNormalization
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, accuracy_score
+from sklearn.model_selection import StratifiedKFold
 from sklearn.utils.class_weight import compute_class_weight
 
 
@@ -47,7 +46,7 @@ def create_binary_temp_dataset(original_path):
 
 
 # 🧪 Load and preprocess binary-class image data
-def load_data_from_folder(path, target_size=(224, 224), batch_size=1, augment=False):
+def load_data_from_folder(path, target_size=(128, 128), batch_size=8, augment=False):
     binary_path = create_binary_temp_dataset(path)
     if augment:
         datagen = ImageDataGenerator(
@@ -75,11 +74,12 @@ def load_data_from_folder(path, target_size=(224, 224), batch_size=1, augment=Fa
 
 # 🧠 Build MobileNetV3 model
 def build_model():
-    base = MobileNetV3Small(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-    base.trainable = True
+    base = MobileNetV3Small(weights='imagenet', include_top=False, input_shape=(128, 128, 3))
+    base.trainable = False  # Freeze the base model to prevent training during initial training phase
 
-    x = GlobalAveragePooling2D()(base.output)
-    # x = BatchNormalization()(x)
+    x = base.output
+    x = GlobalMaxPooling2D()(x)  # Apply GlobalMaxPooling2D to the feature map from MobileNetV3
+    x = BatchNormalization()(x)
     x = Dense(128, activation='relu', kernel_regularizer=l2(0.001))(x)
     x = Dropout(0.5)(x)
     out = Dense(1, activation='sigmoid')(x)
@@ -87,6 +87,7 @@ def build_model():
     model = Model(inputs=base.input, outputs=out)
     model.compile(optimizer=Adam(learning_rate=0.0001), loss='binary_crossentropy', metrics=['accuracy'])
     return model
+
 
 
 # 📁 Dataset paths
@@ -116,37 +117,49 @@ show_class_distribution(test_gen, "Test Set")
 
 print_system_usage("After loading data")
 
-# ✅ Inspect sample batch
-x_batch, y_batch = next(train_gen)
-print("Min pixel value:", np.min(x_batch))
-print("Max pixel value:", np.max(x_batch))
-print(f"🔍 Sample image shape: {x_batch[0].shape}")
-
 # 📉 Callbacks
 early_stop = EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True)
 reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2)
+checkpoint = ModelCheckpoint('best_model.h5', monitor='val_loss', save_best_only=True)
 
 # ⚖️ Compute class weights
 classes = np.array([0, 1])
 weights = compute_class_weight(class_weight='balanced', classes=classes, y=train_gen.classes)
 class_weight = dict(zip(classes, weights))
 
-# 🚀 Train
+
+# 🚀 Train the model with k-fold cross-validation
+def cross_validate(model, train_gen, val_gen, n_splits=5):
+    kfold = StratifiedKFold(n_splits=n_splits, shuffle=True)
+    fold_no = 1
+    for train_idx, val_idx in kfold.split(train_gen.filenames, train_gen.classes):
+        print(f"\n📊 Training fold {fold_no}/{n_splits}...")
+
+        train_gen_subset = train_gen.__getitem__(train_idx)  # Use data for training
+        val_gen_subset = val_gen.__getitem__(val_idx)  # Use data for validation
+
+        history = model.fit(
+            train_gen_subset,
+            validation_data=val_gen_subset,
+            epochs=20,
+            callbacks=[early_stop, reduce_lr, checkpoint],
+            class_weight=class_weight
+        )
+        fold_no += 1
+    return model
+
+
+# 📦 Build and Train the Model
 print("\n🚀 Training model...")
 start_time = time.time()
 model = build_model()
-history = model.fit(
-    train_gen,
-    validation_data=val_gen,
-    epochs=20,
-    callbacks=[early_stop, reduce_lr],
-    class_weight=class_weight
-)
+
+model = cross_validate(model, train_gen, val_gen)
 training_duration = time.time() - start_time
 print(f"⏱️ Training completed in {training_duration:.2f} seconds.")
 print_system_usage("After training")
 
-# 📈 Accuracy and loss plots
+# 📉 Accuracy and loss plots
 plt.figure(figsize=(12, 5))
 plt.subplot(1, 2, 1)
 plt.plot(history.history['accuracy'], label='Train Accuracy', marker='o')
@@ -174,7 +187,7 @@ print("\n🎯 Test Set Results:")
 test_gen.reset()
 y_true = test_gen.classes
 
-print("\n🕒 Starting test-time inference...")
+print("\n🕒 Starting test-time inference with Test-Time Augmentation...")
 test_start_time = time.time()
 y_pred_probs = model.predict(test_gen, verbose=0)
 test_duration = time.time() - test_start_time
@@ -196,25 +209,11 @@ plt.show()
 model.save("mobilenetv3_leaf_model.h5")
 print("\n💾 Model saved as 'mobilenetv3_leaf_model.h5'")
 
-# 🔄 INT8 Quantization (uint8 format)
-def representative_dataset_gen():
-    for _ in range(100):
-        data, _ = next(train_gen)
-        yield [data.astype(np.float32)]
-
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
-converter.optimizations = [tf.lite.Optimize.DEFAULT]
-converter.representative_dataset = representative_dataset_gen
-converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-converter.inference_input_type = tf.uint8
-converter.inference_output_type = tf.uint8
-quantized_model = converter.convert()
-
-# 💾 Save quantized model
-with open("mobilenetv3_leaf_model_int8.tflite", "wb") as f:
-    f.write(quantized_model)
-print("✨ INT8 Quantized TFLite model saved as 'mobilenetv3_leaf_model_int8.tflite'")
-
+tflite_model = converter.convert()
+with open("mobilenetv3_leaf_model.tflite", "wb") as f:
+    f.write(tflite_model)
+print("✨ TFLite model saved as 'mobilenetv3_leaf_model.tflite'")
 
 # 📸 Sample predictions
 matplotlib.rcParams['font.family'] = 'Arial'
